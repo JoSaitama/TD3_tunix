@@ -6,10 +6,10 @@ from td3_tunix.agents.td3.networks import soft_update
 from td3_tunix.agents.td3.train_state import TD3TrainState
 
 
-def make_td3_update(actor_apply, critic_apply):
+def make_td3_update(actor_apply, critic_apply, cfg):
     @jax.jit
-    def update_step(state: TD3TrainState, batch, key, cfg):
-        key_critic, key_actor = jax.random.split(key)
+    def update_step(state: TD3TrainState, batch, key):
+        key_critic, _ = jax.random.split(key)
 
         critic_loss, critic_grads = jax.value_and_grad(critic_loss_fn)(
             state.critic_params,

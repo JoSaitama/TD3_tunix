@@ -1,10 +1,10 @@
-from dataclasses import dataclass
 from typing import Any
 
 import optax
+from flax import struct
 
 
-@dataclass
+@struct.dataclass
 class TD3TrainState:
     actor_params: Any
     critic_params: Any
@@ -14,7 +14,8 @@ class TD3TrainState:
     actor_opt_state: optax.OptState
     critic_opt_state: optax.OptState
 
-    actor_optimizer: optax.GradientTransformation
-    critic_optimizer: optax.GradientTransformation
+    # Optimizer objects contain Python functions, so they should not be traced by JAX.
+    actor_optimizer: optax.GradientTransformation = struct.field(pytree_node=False)
+    critic_optimizer: optax.GradientTransformation = struct.field(pytree_node=False)
 
-    total_it: int = 0
+    total_it: Any = 0
