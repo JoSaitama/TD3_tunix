@@ -1,0 +1,9 @@
+jax
+flax
+optax
+brax
+chex
+ml-collections
+numpy
+tqdm
+matplotlib
