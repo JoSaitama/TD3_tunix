@@ -22,19 +22,10 @@ def masked_lower_median(values: jnp.ndarray, mask: jnp.ndarray):
 
 def masked_min_max(values: jnp.ndarray, mask: jnp.ndarray):
     """Compute min/max over valid values only."""
-    valid_count = jnp.sum(mask.astype(jnp.int32))
-
     safe_min_values = jnp.where(mask, values, jnp.inf)
     safe_max_values = jnp.where(mask, values, -jnp.inf)
 
-    raw_min = jnp.min(safe_min_values)
-    raw_max = jnp.max(safe_max_values)
-
-    # Avoid invalid clipping bounds when there is no valid history.
-    min_value = jnp.where(valid_count > 0, raw_min, 0.0)
-    max_value = jnp.where(valid_count > 0, raw_max, 0.0)
-
-    return min_value, max_value, valid_count
+    return jnp.min(safe_min_values), jnp.max(safe_max_values)
 
 
 def least_q_decision(
@@ -100,15 +91,14 @@ def least_qloss_decision(
       epsilon_i = Median(B_Q[:, i])
       omega_i   = Median(B_G[:, i]) / L_i
 
-    Rule before clipping:
+    Rule:
       if epsilon_i >= 0:
           stop if q_current < omega_i * epsilon_i
       else:
           stop if q_current < epsilon_i / omega_i
 
-    This version additionally clips the adjusted threshold into the observed
-    step-wise Q range of the active local reflection set. This avoids extreme
-    thresholds when omega_i is very large or very small.
+    active_slot_mask optionally restricts the median calculation to a
+    dynamic local reflection buffer.
     """
     step = jnp.minimum(
         jnp.array(episode_step, dtype=jnp.int32),
@@ -136,20 +126,13 @@ def least_qloss_decision(
         epsilon_i / omega_i,
     )
 
-    q_min_i, q_max_i, q_range_valid_count = masked_min_max(
-        q_column,
-        valid_column,
-    )
+    q_min_i, q_max_i = masked_min_max(q_column, valid_column)
 
-    clipped_threshold = jnp.clip(
-        raw_threshold,
-        q_min_i,
-        q_max_i,
-    )
-
+    # Paper-faithful safeguard: limit extreme threshold adjustment
+    # within the observed step-wise Q range of the local reflection set.
     threshold = jnp.where(
-        q_range_valid_count > 0,
-        clipped_threshold,
+        valid_count > 0,
+        jnp.clip(raw_threshold, q_min_i, q_max_i),
         raw_threshold,
     )
 

@@ -4,7 +4,7 @@ set -e
 source ~/td3-venv/bin/activate
 cd ~/TD3_tunix
 
-python -m td3_tunix.training.train_td3_least_qloss \
+python -u -m td3_tunix.training.train_td3_least_qloss \
   --env_name halfcheetah \
   --seed 0 \
   --total_steps 50000 \
