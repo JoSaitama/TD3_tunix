@@ -1,0 +1,454 @@
+import argparse
+import time
+
+import jax
+import jax.numpy as jnp
+import optax
+
+from configs.td3_brax_halfcheetah import get_config
+from td3_tunix.envs.make_env import make_brax_env
+from td3_tunix.agents.td3.networks import Actor, Critic
+from td3_tunix.agents.td3.train_state import TD3TrainState
+from td3_tunix.agents.td3.update import make_td3_update
+from td3_tunix.agents.td3.agent import select_action, random_action
+from td3_tunix.replay.replay_buffer import (
+    create_replay_buffer,
+    add_transition,
+    sample_batch,
+)
+from td3_tunix.training.eval import evaluate_policy
+from td3_tunix.least.reflection_buffer import (
+    create_least_qloss_buffer,
+    record_q_loss_value,
+    advance_qloss_episode_slot,
+)
+from td3_tunix.least.stop_rule import (
+    compute_current_q_and_td_error,
+    least_qloss_decision,
+)
+from td3_tunix.least.dynamic_buffer import (
+    make_active_slot_mask,
+    estimate_q_entropy,
+    update_active_size,
+)
+from td3_tunix.least.noise_schedule import (
+    create_noise_state,
+    record_episode_stop,
+    update_exploration_noise,
+    recent_stop_rate,
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    # TD3 / environment arguments
+    parser.add_argument("--env_name", type=str, default="halfcheetah")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--total_steps", type=int, default=5000)
+    parser.add_argument("--start_timesteps", type=int, default=1000)
+    parser.add_argument("--eval_freq", type=int, default=1000)
+    parser.add_argument("--replay_size", type=int, default=50000)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--max_episode_steps", type=int, default=1000)
+    parser.add_argument("--num_eval_episodes", type=int, default=3)
+
+    # LEAST-Q-loss arguments
+    parser.add_argument("--least_start_steps", type=int, default=2000)
+    parser.add_argument("--least_buffer_size", type=int, default=20)
+    parser.add_argument("--least_min_ref_episodes", type=int, default=2)
+    parser.add_argument("--least_min_episode_steps", type=int, default=50)
+    parser.add_argument("--omega_clip_min", type=float, default=0.2)
+    parser.add_argument("--omega_clip_max", type=float, default=5.0)
+
+    # Dynamic local reflection buffer
+    parser.add_argument("--dynamic_buffer", action="store_true")
+    parser.add_argument("--dynamic_update_freq", type=int, default=500)
+    parser.add_argument("--dynamic_entropy_bins", type=int, default=20)
+    parser.add_argument("--dynamic_entropy_gamma", type=float, default=0.2)
+    parser.add_argument("--dynamic_adjust_scale", type=int, default=2)
+    parser.add_argument("--dynamic_min_active_size", type=int, default=5)
+    parser.add_argument("--dynamic_initial_active_size", type=int, default=20)
+
+    # Adaptive exploration noise schedule
+    parser.add_argument("--adaptive_noise", action="store_true")
+    parser.add_argument("--noise_window_episodes", type=int, default=20)
+    parser.add_argument("--noise_target_stop_rate", type=float, default=0.35)
+    parser.add_argument("--noise_max", type=float, default=0.35)
+    parser.add_argument("--noise_smoothing", type=float, default=0.25)
+    parser.add_argument("--noise_min_events", type=int, default=5)
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    cfg = get_config()
+
+    cfg.env_name = args.env_name
+    cfg.seed = args.seed
+    cfg.total_steps = args.total_steps
+    cfg.start_timesteps = args.start_timesteps
+    cfg.eval_freq = args.eval_freq
+    cfg.replay_size = args.replay_size
+    cfg.batch_size = args.batch_size
+    cfg.max_episode_steps = args.max_episode_steps
+    cfg.num_eval_episodes = args.num_eval_episodes
+
+    print("JAX backend:", jax.default_backend())
+    print("JAX devices:", jax.devices())
+    print("Config:", cfg)
+    print(
+        "LEAST-Q-loss config:",
+        {
+            "least_start_steps": args.least_start_steps,
+            "least_buffer_size": args.least_buffer_size,
+            "least_min_ref_episodes": args.least_min_ref_episodes,
+            "least_min_episode_steps": args.least_min_episode_steps,
+            "omega_clip_min": args.omega_clip_min,
+            "omega_clip_max": args.omega_clip_max,
+            "dynamic_buffer": args.dynamic_buffer,
+            "dynamic_update_freq": args.dynamic_update_freq,
+            "dynamic_entropy_gamma": args.dynamic_entropy_gamma,
+            "dynamic_adjust_scale": args.dynamic_adjust_scale,
+            "dynamic_min_active_size": args.dynamic_min_active_size,
+            "dynamic_initial_active_size": args.dynamic_initial_active_size,
+            "adaptive_noise": args.adaptive_noise,
+            "noise_window_episodes": args.noise_window_episodes,
+            "noise_target_stop_rate": args.noise_target_stop_rate,
+            "noise_max": args.noise_max,
+            "noise_smoothing": args.noise_smoothing,
+            "noise_min_events": args.noise_min_events,
+        },
+    )
+
+    key = jax.random.PRNGKey(cfg.seed)
+
+    env = make_brax_env(cfg.env_name)
+    reset_fn = jax.jit(env.reset)
+    step_fn = jax.jit(env.step)
+
+    obs_dim = env.observation_size
+    action_dim = env.action_size
+
+    print("Env:", cfg.env_name)
+    print("Observation dim:", obs_dim)
+    print("Action dim:", action_dim)
+
+    key, key_actor, key_critic, key_env = jax.random.split(key, 4)
+
+    actor = Actor(
+        action_dim=action_dim,
+        hidden_dims=(cfg.hidden_dim, cfg.hidden_dim),
+    )
+    critic = Critic(
+        hidden_dims=(cfg.hidden_dim, cfg.hidden_dim),
+    )
+
+    dummy_obs = jnp.zeros((1, obs_dim), dtype=jnp.float32)
+    dummy_action = jnp.zeros((1, action_dim), dtype=jnp.float32)
+
+    actor_params = actor.init(key_actor, dummy_obs)
+    critic_params = critic.init(key_critic, dummy_obs, dummy_action)
+
+    actor_optimizer = optax.adam(cfg.actor_lr)
+    critic_optimizer = optax.adam(cfg.critic_lr)
+
+    td3_state = TD3TrainState(
+        actor_params=actor_params,
+        critic_params=critic_params,
+        target_actor_params=actor_params,
+        target_critic_params=critic_params,
+        actor_opt_state=actor_optimizer.init(actor_params),
+        critic_opt_state=critic_optimizer.init(critic_params),
+        actor_optimizer=actor_optimizer,
+        critic_optimizer=critic_optimizer,
+        total_it=0,
+    )
+
+    replay_buffer = create_replay_buffer(
+        capacity=cfg.replay_size,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+    )
+
+    least_buffer = create_least_qloss_buffer(
+        buffer_size=args.least_buffer_size,
+        max_episode_steps=cfg.max_episode_steps,
+    )
+
+    active_size = jnp.array(
+        min(args.dynamic_initial_active_size, args.least_buffer_size),
+        dtype=jnp.int32,
+    )
+    baseline_entropy = None
+    current_entropy = jnp.array(0.0, dtype=jnp.float32)
+
+    noise_state = create_noise_state(
+        window_size=args.noise_window_episodes,
+        base_noise=cfg.exploration_noise,
+    )
+    current_recent_stop_rate = jnp.array(0.0, dtype=jnp.float32)
+
+    update_step = make_td3_update(
+        actor.apply,
+        critic.apply,
+        cfg,
+    )
+
+    env_state = reset_fn(key_env)
+
+    episode_return = 0.0
+    episode_length = 0
+    episode_count = 0
+
+    least_stop_count = 0
+    natural_or_timeout_count = 0
+
+    start_time = time.time()
+
+    for t in range(cfg.total_steps):
+        key, action_key, td_key, sample_key, update_key, reset_key, eval_key = jax.random.split(
+            key,
+            7,
+        )
+
+        obs = env_state.obs
+        current_episode_step = episode_length
+
+        if args.adaptive_noise:
+            exploration_noise = float(jax.device_get(noise_state.current_noise))
+        else:
+            exploration_noise = cfg.exploration_noise
+
+        if t < cfg.start_timesteps:
+            action = random_action(action_key, action_dim)
+        else:
+            action = select_action(
+                actor.apply,
+                td3_state.actor_params,
+                obs,
+                action_key,
+                exploration_noise,
+            )
+
+        next_env_state = step_fn(env_state, action)
+
+        reward = next_env_state.reward
+        env_done = next_env_state.done
+
+        current_q, current_td_error = compute_current_q_and_td_error(
+            actor_apply=actor.apply,
+            critic_apply=critic.apply,
+            actor_params=td3_state.actor_params,
+            critic_params=td3_state.critic_params,
+            target_actor_params=td3_state.target_actor_params,
+            target_critic_params=td3_state.target_critic_params,
+            obs=obs,
+            action=action,
+            reward=reward,
+            next_obs=next_env_state.obs,
+            done=env_done.astype(jnp.float32),
+            key=td_key,
+            gamma=cfg.gamma,
+            policy_noise=cfg.policy_noise,
+            noise_clip=cfg.noise_clip,
+        )
+
+        active_slot_mask = make_active_slot_mask(
+            current_slot=least_buffer.current_slot,
+            buffer_size=args.least_buffer_size,
+            active_size=active_size,
+        )
+
+        least_stop, threshold, valid_count, epsilon_i, median_loss_i, omega_i = least_qloss_decision(
+            q_current=current_q,
+            loss_current=current_td_error,
+            q_history=least_buffer.q_values,
+            loss_history=least_buffer.loss_values,
+            valid_history=least_buffer.valid,
+            episode_step=current_episode_step,
+            global_step=t,
+            least_start_steps=args.least_start_steps,
+            min_ref_episodes=args.least_min_ref_episodes,
+            least_min_episode_steps=args.least_min_episode_steps,
+            active_slot_mask=active_slot_mask if args.dynamic_buffer else None,
+            omega_clip_min=args.omega_clip_min,
+            omega_clip_max=args.omega_clip_max,
+        )
+
+        # Record after decision, so current transition does not affect its own threshold.
+        least_buffer = record_q_loss_value(
+            least_buffer,
+            episode_step=current_episode_step,
+            q_value=current_q,
+            loss_value=current_td_error,
+        )
+
+        if (
+            args.dynamic_buffer
+            and t >= args.least_start_steps
+            and (t + 1) % args.dynamic_update_freq == 0
+        ):
+            entropy_mask = make_active_slot_mask(
+                current_slot=least_buffer.current_slot,
+                buffer_size=args.least_buffer_size,
+                active_size=active_size,
+            )
+
+            current_entropy = estimate_q_entropy(
+                q_values=least_buffer.q_values,
+                valid=least_buffer.valid,
+                active_slot_mask=entropy_mask,
+                num_bins=args.dynamic_entropy_bins,
+            )
+
+            if baseline_entropy is None:
+                baseline_entropy = current_entropy
+
+            old_active_size = active_size
+
+            active_size = update_active_size(
+                active_size=active_size,
+                current_entropy=current_entropy,
+                baseline_entropy=baseline_entropy,
+                overflow_rate=args.dynamic_entropy_gamma,
+                adjust_scale=args.dynamic_adjust_scale,
+                min_active_size=args.dynamic_min_active_size,
+                max_active_size=args.least_buffer_size,
+            )
+
+            if int(jax.device_get(old_active_size)) != int(jax.device_get(active_size)):
+                print(
+                    f"[dynamic_buffer] step={t + 1}, "
+                    f"entropy={float(jax.device_get(current_entropy)):.4f}, "
+                    f"baseline_entropy={float(jax.device_get(baseline_entropy)):.4f}, "
+                    f"active_size={int(jax.device_get(old_active_size))}"
+                    f"->{int(jax.device_get(active_size))}"
+                )
+
+        # LEAST stop is artificial truncation.
+        # TD target uses env_done only.
+        replay_buffer = add_transition(
+            replay_buffer,
+            obs=obs,
+            action=action,
+            reward=reward,
+            next_obs=next_env_state.obs,
+            done=env_done.astype(jnp.float32),
+        )
+
+        episode_return += float(jax.device_get(reward))
+        episode_length += 1
+
+        done_bool = bool(jax.device_get(env_done))
+        least_stop_bool = bool(jax.device_get(least_stop))
+        timeout_bool = episode_length >= cfg.max_episode_steps
+
+        if done_bool or least_stop_bool or timeout_bool:
+            episode_count += 1
+
+            if least_stop_bool:
+                least_stop_count += 1
+            else:
+                natural_or_timeout_count += 1
+
+            if args.adaptive_noise:
+                old_noise = noise_state.current_noise
+
+                noise_state = record_episode_stop(
+                    noise_state,
+                    jnp.array(1.0 if least_stop_bool else 0.0, dtype=jnp.float32),
+                )
+
+                noise_state, current_recent_stop_rate = update_exploration_noise(
+                    state=noise_state,
+                    base_noise=cfg.exploration_noise,
+                    max_noise=args.noise_max,
+                    target_stop_rate=args.noise_target_stop_rate,
+                    smoothing=args.noise_smoothing,
+                    min_events=args.noise_min_events,
+                )
+
+                if abs(
+                    float(jax.device_get(noise_state.current_noise))
+                    - float(jax.device_get(old_noise))
+                ) > 1e-6:
+                    print(
+                        f"[adaptive_noise] episode={episode_count}, "
+                        f"recent_stop_rate={float(jax.device_get(current_recent_stop_rate)):.3f}, "
+                        f"noise={float(jax.device_get(old_noise)):.4f}"
+                        f"->{float(jax.device_get(noise_state.current_noise)):.4f}"
+                    )
+            else:
+                current_recent_stop_rate = recent_stop_rate(noise_state)
+
+            stop_tag = "LEAST_STOP" if least_stop_bool else "ENV_OR_TIMEOUT"
+
+            print(
+                f"[episode {episode_count}] "
+                f"step={t + 1}, "
+                f"return={episode_return:.2f}, "
+                f"length={episode_length}, "
+                f"end={stop_tag}, "
+                f"stop_step={current_episode_step}, "
+                f"q={float(jax.device_get(current_q)):.4f}, "
+                f"td_error={float(jax.device_get(current_td_error)):.4f}, "
+                f"epsilon={float(jax.device_get(epsilon_i)):.4f}, "
+                f"median_loss={float(jax.device_get(median_loss_i)):.4f}, "
+                f"omega={float(jax.device_get(omega_i)):.4f}, "
+                f"threshold={float(jax.device_get(threshold)):.4f}, "
+                f"valid_count={int(jax.device_get(valid_count))}, "
+                f"active_size={int(jax.device_get(active_size))}, "
+                f"exploration_noise={float(jax.device_get(noise_state.current_noise)):.4f}, "
+                f"recent_stop_rate={float(jax.device_get(current_recent_stop_rate)):.3f}"
+            )
+
+            least_buffer = advance_qloss_episode_slot(least_buffer)
+            env_state = reset_fn(reset_key)
+
+            episode_return = 0.0
+            episode_length = 0
+        else:
+            env_state = next_env_state
+
+        if t >= cfg.start_timesteps and replay_buffer.size >= cfg.batch_size:
+            batch = sample_batch(replay_buffer, sample_key, cfg.batch_size)
+            td3_state, metrics = update_step(td3_state, batch, update_key)
+
+        if (t + 1) % cfg.eval_freq == 0:
+            avg_return, key = evaluate_policy(
+                env=env,
+                actor_apply=actor.apply,
+                actor_params=td3_state.actor_params,
+                key=eval_key,
+                num_episodes=cfg.num_eval_episodes,
+                max_episode_steps=cfg.max_episode_steps,
+            )
+
+            elapsed = time.time() - start_time
+            total_ended = least_stop_count + natural_or_timeout_count
+            least_stop_rate = (
+                least_stop_count / total_ended if total_ended > 0 else 0.0
+            )
+
+            print(
+                f"[eval] step={t + 1}, "
+                f"avg_return={avg_return:.2f}, "
+                f"buffer_size={int(jax.device_get(replay_buffer.size))}, "
+                f"td3_updates={td3_state.total_it}, "
+                f"least_stops={least_stop_count}, "
+                f"episode_ends={total_ended}, "
+                f"least_stop_rate={least_stop_rate:.3f}, "
+                f"active_size={int(jax.device_get(active_size))}, "
+                f"entropy={float(jax.device_get(current_entropy)):.4f}, "
+                f"exploration_noise={float(jax.device_get(noise_state.current_noise)):.4f}, "
+                f"recent_stop_rate={float(jax.device_get(current_recent_stop_rate)):.3f}, "
+                f"elapsed_sec={elapsed:.1f}"
+            )
+
+    print("TD3 + LEAST-Q-loss training run finished.")
+
+
+if __name__ == "__main__":
+    main()

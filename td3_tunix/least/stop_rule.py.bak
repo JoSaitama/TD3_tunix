@@ -24,6 +24,7 @@ def least_q_decision(
     q_current,
     q_history: jnp.ndarray,
     valid_history: jnp.ndarray,
+    active_slot_mask=None,
     episode_step: int,
     global_step: int,
     least_start_steps: int,
@@ -72,25 +73,27 @@ def least_qloss_decision(
     least_start_steps: int,
     min_ref_episodes: int,
     least_min_episode_steps: int,
-    active_slot_mask=None,
     omega_clip_min: float = 0.2,
     omega_clip_max: float = 5.0,
 ):
     """LEAST-Q-loss decision.
 
-    Algorithm core:
+    This implements the core Algorithm 1 stopping logic:
 
       epsilon_i = Median(B_Q[:, i])
       omega_i   = Median(B_G[:, i]) / L_i
 
-    Rule:
+    Complete rule:
       if epsilon_i >= 0:
           stop if q_current < omega_i * epsilon_i
       else:
           stop if q_current < epsilon_i / omega_i
 
-    active_slot_mask optionally restricts the median calculation to a
-    dynamic local reflection buffer.
+    Interpretation:
+      - high current loss means high learning potential
+      - high learning potential makes stopping less likely
+      - low current loss means familiar / already learned
+      - low Q + low loss makes stopping more likely
     """
     step = jnp.minimum(
         jnp.array(episode_step, dtype=jnp.int32),
@@ -108,7 +111,6 @@ def least_qloss_decision(
     median_loss_i, _ = masked_lower_median(loss_column, valid_column)
 
     safe_loss_current = jnp.maximum(loss_current, 1e-8)
-
     omega_i = median_loss_i / safe_loss_current
     omega_i = jnp.clip(omega_i, omega_clip_min, omega_clip_max)
 
