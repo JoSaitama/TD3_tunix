@@ -21,6 +21,7 @@ def main():
     step_fn = jax.jit(env.step)
 
     state = reset_fn(key)
+
     print("Initial obs shape:", state.obs.shape)
     print("Initial reward:", state.reward)
     print("Initial done:", state.done)
@@ -31,6 +32,7 @@ def main():
     print("Next obs shape:", next_state.obs.shape)
     print("Next reward:", next_state.reward)
     print("Next done:", next_state.done)
+
     print("Brax env smoke test passed.")
 
 
