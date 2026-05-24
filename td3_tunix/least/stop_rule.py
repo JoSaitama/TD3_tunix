@@ -1,4 +1,3 @@
-import jax
 import jax.numpy as jnp
 
 
@@ -8,7 +7,6 @@ def masked_lower_median(values: jnp.ndarray, mask: jnp.ndarray):
     This avoids dynamic-shape indexing and is friendly to JAX/XLA.
 
     If values = [1, 3, 5, 7], lower median = 3.
-    That is enough for a robust LEAST-Q threshold in the first version.
     """
     valid_count = jnp.sum(mask.astype(jnp.int32))
 
@@ -29,15 +27,20 @@ def least_q_decision(
     global_step: int,
     least_start_steps: int,
     min_ref_episodes: int,
+    least_min_episode_steps: int,
 ):
     """Return whether LEAST-Q should stop the current episode.
 
     Stop rule:
       stop if q_current < median(BQ[:, episode_step])
 
-    Only activated after:
-      global_step >= least_start_steps
-      and enough valid reference episodes exist at this episode step.
+    Activation conditions:
+      1. global_step >= least_start_steps
+      2. valid_count >= min_ref_episodes
+      3. episode_step >= least_min_episode_steps
+
+    The third condition is an engineering guard to avoid immediate
+    reset-collapse at the first few steps of each episode.
     """
     step = jnp.minimum(
         jnp.array(episode_step, dtype=jnp.int32),
@@ -54,9 +57,15 @@ def least_q_decision(
 
     enough_history = valid_count >= min_ref_episodes
     after_start = global_step >= least_start_steps
+    after_min_episode_step = episode_step >= least_min_episode_steps
+
+    can_stop = jnp.logical_and(
+        jnp.logical_and(after_start, enough_history),
+        after_min_episode_step,
+    )
 
     stop = jnp.logical_and(
-        jnp.logical_and(after_start, enough_history),
+        can_stop,
         q_current < threshold,
     )
 

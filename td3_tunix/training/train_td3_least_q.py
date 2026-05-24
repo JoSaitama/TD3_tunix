@@ -50,6 +50,7 @@ def parse_args():
     parser.add_argument("--least_start_steps", type=int, default=10000)
     parser.add_argument("--least_buffer_size", type=int, default=20)
     parser.add_argument("--least_min_ref_episodes", type=int, default=5)
+    parser.add_argument("--least_min_episode_steps", type=int, default=50)
 
     return parser.parse_args()
 
@@ -77,6 +78,7 @@ def main():
             "least_start_steps": args.least_start_steps,
             "least_buffer_size": args.least_buffer_size,
             "least_min_ref_episodes": args.least_min_ref_episodes,
+            "least_min_episode_steps": args.least_min_episode_steps,
         },
     )
 
@@ -194,6 +196,7 @@ def main():
             global_step=t,
             least_start_steps=args.least_start_steps,
             min_ref_episodes=args.least_min_ref_episodes,
+            least_min_episode_steps=args.least_min_episode_steps,
         )
 
         # Record current Q after decision, so threshold uses previous episodes only.
